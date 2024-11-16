@@ -42,6 +42,9 @@ EOF
 APK_BIN="apk"
 FSTYPE="erofs"
 [ -z "$MKLIVE_BOOTLOADER" ] && MKLIVE_BOOTLOADER="grub"
+[ -z "$MKLIVE_IMAGE_TYPE" ] && MKLIVE_IMAGE_TYPE="isohybrid"
+
+IMAGE_EXT=$([ "$MKLIVE_IMAGE_TYPE" == "mbr" ] && echo "img" || echo "iso")
 
 if ! command -v "$APK_BIN" > /dev/null 2>&1; then
     die "invalid apk command"
@@ -90,13 +93,27 @@ case "$MKLIVE_BOOTLOADER" in
         ;;
 esac
 
+case "$MKLIVE_IMAGE_TYPE" in
+    mbr)
+        if ! command -v mformat > /dev/null 2>&1; then
+            die "mtools needs to be installed"
+        fi
+        ;;
+    isohybrid)
+        if ! command -v xorriso > /dev/null 2>&1; then
+            die "xorriso needs to be installed"
+        fi
+        ;;
+    *) die "unknown image type ($MKLIVE_IMAGE_TYPE)" ;;
+esac
+
 shift $((OPTIND - 1))
 
 ISO_VERSION=$(date '+%Y%m%d')
 
 # default output file
 if [ -z "$OUT_FILE" ]; then
-    OUT_FILE="chimera-linux-${APK_ARCH}-LIVE-${ISO_VERSION}${FLAVOR}.iso"
+    OUT_FILE="chimera-linux-${APK_ARCH}-LIVE-${ISO_VERSION}${FLAVOR}.${IMAGE_EXT}"
 fi
 
 if [ -z "$APK_REPO" ]; then
@@ -297,8 +314,8 @@ case "$FSTYPE" in
         ;;
 esac
 
-# generate iso image
-msg "Generating ISO image..."
+# generate image
+msg "Generating image..."
 
 mount_pseudo
 
@@ -310,6 +327,26 @@ generate_menu() {
      -e "s|@@ARCH@@|${APK_ARCH}|g" \
      -e "s|@@BOOT_CMDLINE@@||g" \
      "$1"
+}
+
+get_block_size() {
+    du -B 512 $1 | awk '{ print $1 }'
+}
+
+generate_mbr_limine() {
+    # calculate initial size based on live filesystem image
+    EROFS_SIZE=$(get_block_size $LIVE_DIR/filesystem.erofs)
+    SQUASHFS_SIZE=$(get block_size $LIVE_DIR/filesystem.squashfs)
+    INITRD_SIZE=$(get_block_size $LIVE_DIR/initrd)
+    KERNEL_SIZE=$(get_block_size $LIVE_DIR/vmlinuz)
+    PART_SIZE=$((EROFS_SIZE + SQUASHFS_SIZE + INITRD_SIZE + KERNEL_SIZE + 7812)) 
+    dd if=/dev/zero bs=512 count=$PART_SIZE seek=64 "of=${BUILD_DIR}/image.img"
+    echo 'start=64, type=0c, bootable' | sfdisk "${BUILD_DIR}/image.img"
+    mformat -F -i "${BUILD_DIR}/image.img@@32768"
+    mcopy -s -v -i "${BUILD_DIR}/image.img@@32768" "${IMAGE_DIR}/live" ::live
+    mcopy -v -i "${BUILD_DIR}/image.img@@32768" "${IMAGE_DIR}/limine.conf" ::
+    mcopy -v -i "${BUILD_DIR}/image.img@@32768" "${IMAGE_DIR}/limine-bios.sys" ::
+    mcopy -v -i "${BUILD_DIR}/image.img@@32768" "${IMAGE_DIR}/limine-bios-cd.bin" ::
 }
 
 generate_iso_grub() {
@@ -356,9 +393,17 @@ case "$MKLIVE_BOOTLOADER" in
                 cp "${ROOT_DIR}/usr/share/limine/limine-bios-cd.bin" "${IMAGE_DIR}"
                 cp "${ROOT_DIR}/usr/share/limine/limine-bios.sys" "${IMAGE_DIR}"
                 # generate image
-                generate_isohybrid_limine || die "failed to generate ISO image"
+                case "$MKLIVE_IMAGE_TYPE" in
+                    mbr)
+                        generate_mbr_limine || die "failed to generate image"
+                        ;;
+                    hybrid)
+                        generate_isohybrid_limine || die "failed to generate ISO image"
+                        ;;
+                    *) die "Unknown image type $MKLIVE_IMAGE_TYPE for limine on x86_64" ;;
+                esac
                 # and install bios
-                chroot "${ROOT_DIR}" /usr/bin/limine bios-install "/mnt/image.iso"
+                chroot "${ROOT_DIR}" /usr/bin/limine bios-install "/mnt/image.${IMAGE_EXT}"
                 ;;
             aarch64|riscv64)
                 generate_efi_limine || die "failed to generate ISO image"
@@ -379,6 +424,6 @@ esac
 umount -f "${ROOT_DIR}/mnt"
 umount_pseudo
 
-mv "${BUILD_DIR}/image.iso" "$OUT_FILE"
+mv "${BUILD_DIR}/image.${IMAGE_EXT}" "$OUT_FILE"
 
-msg "Successfully generated image (${OUT_FILE})"
+msg "Successfully generated image $OUT_FILE"
